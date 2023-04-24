@@ -309,6 +309,10 @@ for i, key in enumerate(data):
             for image in newImages:
                 response = requests.get(image['url'], stream=True, headers={'User-Agent': user_agent})
 
+                if response.status_code == 404:
+                    bar.update(1)
+                    continue
+                
                 image_data = BytesIO()
 
                 for chunk in response.iter_content(chunk_size=download_chunk_size):
