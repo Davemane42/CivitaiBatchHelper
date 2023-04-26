@@ -264,22 +264,20 @@ for i, key in enumerate(data):
 
         description = model['data']['description']
 
-        description = description.replace('<p>', '').replace('</p>', '\n')
-        description = re.sub(r'<br[^>]*>', '\n', description)
-        description = description.replace('<li>', '\t').replace('</li>', '')
+        description = re.sub(r'<a.*?href="(.*?)".*?<\/a>', r'\g<1>', description) # Link
+        description = re.sub(r'<img.*?src="(.*?)".*?>', r'\g<1>', description) # Image
+        description = re.sub(r'<li>(.*?)<\/li>', r'- \g<1>', description) # List item
 
-        while True:
-            m = re.search(r'<a.*?<\/a>', description)
-            if not m:
-                break
+        description = re.sub(r'<div(.*?)\/div>', r'\n\g<1>\n', description) # div
+        description = re.sub(r'<h[0-9]>(.*?)<\/h[0-9]>', r'\g<1>\n', description) # Header
+        description = re.sub(r'<p>(.*?)<\/p>', r'\g<1>\n', description) # Paragraph
+        description = re.sub(r'<br[^>]*>', '\n', description) # br
 
-            matchText = m.group(0)
-            matchURL = re.search(r'href="([^"]*)">', matchText).group(1)
-            description = f'{description[:m.start(0)]}{matchURL}{description[m.end(0):]}'
-        
-        description = re.sub(r'<[^>]*>', '', description)
+        description = re.sub(r'<[^>]*>', '', description) # Remove all other <tag> or </tag>
 
-        description = f"\n\nVersion Description:\n{description}"
+        description = '\n'.join([line.strip() for line in description.splitlines()])
+
+        description = f'\n\nVersion Description:\n{description}'
     else:
         description = ''
 
