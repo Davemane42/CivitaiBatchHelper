@@ -60,13 +60,14 @@ def save_cache():
     with open(cachePath, 'w', encoding='utf-8') as f:
         json.dump(cache, f, ensure_ascii=False, indent=1)
 
-# Settings
-#defaultInputPath = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'models')
+def get_relative_path(path):
+    return os.path.relpath(path, start=settings['models_path'])
 
+# Settings
 folderPath = os.path.join(os.path.dirname(os.path.realpath(__file__)))
 os.makedirs(folderPath, exist_ok=True)
 
-defaultSettings = {'civitai_api_key': None, 'models_path': None}
+defaultSettings = {'civitai_api_key': None, 'models_path': None, 'output_path': None}
 settingPath = os.path.join(folderPath, 'settings.json')
 try:
     with open(settingPath, 'r') as f:
@@ -78,17 +79,6 @@ except FileNotFoundError:
 
 settings = defaultSettings | settings
 
-# Cache
-cachePath = os.path.join(folderPath, 'cache.json')
-try:
-    with open(cachePath, 'r') as f:
-        cache = json.load(f)
-except FileNotFoundError:
-    with open(settingPath, 'w') as f:
-        json.dump({}, f, ensure_ascii=False, indent=1)
-        cache = {}
-
-# Api Key
 def changeValue(key, text):
     while True:
         inputText = input(text)
@@ -100,13 +90,16 @@ def changeValue(key, text):
         elif inputText.lower() != "n":
             print("Input a valid value")
 
+# Api Key
 if not settings['civitai_api_key']:
+    print('Civitai API key can be generated at the bottom of your "Account settings" page')
     changeValue('civitai_api_key', 'API Key: ')
 
-#Input
+# Input folder
 if not settings['models_path']:
+    print('\nThe models folder is where all your checkpoints/loras are located')
     while True:
-        changeValue('models_path', 'Input Path: ')
+        changeValue('models_path', 'Model folder path: ')
 
         if os.path.exists(settings['models_path']):
             if os.path.isfile(settings['models_path']):
@@ -115,9 +108,44 @@ if not settings['models_path']:
         else:
             print("Input a valid input path")
 
+# Output folder
+if not settings['output_path']:
+    print('\nThe output folder is where all the data will be generated')
+    while True:
+        print(f'Default output path is: "{folderPath}"')
+
+        inputText = input("Confirm? (y/n): ")
+        if inputText.lower() == "y" or inputText == "":
+            settings['output_path'] = folderPath
+            break
+        elif inputText.lower() == "n":
+            break
+        else:
+            print("Input a valid value")
+    if not settings['output_path']:
+        while True:
+            changeValue('output_path', 'Output folder path: ')
+
+            if os.path.exists(settings['output_path']):
+                if os.path.isfile(settings['output_path']):
+                    settings['output_path'] = os.path.dirname(settings['output_path'])
+                break
+            else:
+                print("Input a valid input path")
+
 # Save Settings
 with open(settingPath, 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=1)
+
+# Cache
+cachePath = os.path.join(folderPath, settings['output_path'], 'cache.json')
+try:
+    with open(cachePath, 'r') as f:
+        cache = json.load(f)
+except FileNotFoundError:
+    with open(settingPath, 'w') as f:
+        json.dump({}, f, ensure_ascii=False, indent=1)
+        cache = {}
 
 files = []
 filetypes = ('*.safetensors', '*.ckpt')
@@ -136,21 +164,34 @@ for i, file in enumerate(files):
     if fileName in cache:
         sha256 = cache[fileName]['SHA256']
     else:
+        fileSize = os.stat(file).st_size / (1024*1024*1024) # in GB
+
+        if fileSize > 1:
+            print(f'\nFile size is {fileSize:.2f}GB, this might take a while')
+
         print(f'{i+1:>{lenCount}d}/{fileCount} caching hash {fileName} -> ',end="")
         sha256 = calculate_sha256(file).upper()
         cache[fileName] = {}
         cache[fileName]['SHA256'] = sha256
         cache[fileName]['type'] = None
         print(f'{sha256}')
+
+        if fileSize > 1:
+            save_cache()
+    
+    if sha256 in data:
+        print(f'"{get_relative_path(file)}" is a duplicate of "{get_relative_path(data[sha256]["path"])}"')
+        continue
     
     data[sha256] = {}
     data[sha256]['path'] = file
     data[sha256]['fileName'] = fileName
     data[sha256]['data'] = {}
+    
 
 save_cache()
 
-# split in chunk of 100
+# civitai request by hash
 hashes = [value for value in data.keys()]
 if len(hashes) != 0:
     print(f"\nRequesting: {len(hashes)} models from Civitai.com")
@@ -170,8 +211,16 @@ print(f"Matched: {len(results)} models\n")
 for result in results:
     found = False
     for file in result['files']:
+        
+        if not 'SHA256' in file['hashes']:
+            continue
+
         sha256 = file['hashes']['SHA256']
+
         if not sha256 in data:
+            continue
+
+        if file['type'] == 'VAE':
             continue
 
         data[sha256]['data'] = result
@@ -189,7 +238,7 @@ for i, key in enumerate(data):
     counter = f'{i+1:>{lenCount}d}/{dataCount}'
 
     if model["data"] == {}:
-        path = os.path.relpath(model['path'], start=settings['models_path'])
+        path = get_relative_path(model['path'])
         print(f'{counter} Could not find Civitai Data for "{path}"')
         continue
     
@@ -202,9 +251,9 @@ for i, key in enumerate(data):
     versionName = model['data']['name']
     versionID = model['data']['id']
     
-    newPath = os.path.join(folderPath, modelType, fileName)
+    newPath = os.path.join(folderPath, settings['output_path'], modelType, fileName)
 
-    os.makedirs(os.path.join(folderPath, modelType), exist_ok=True)
+    os.makedirs(os.path.join(folderPath, settings['output_path'], modelType), exist_ok=True)
     os.makedirs(newPath, exist_ok=True)
     cache[model['fileName']]['type'] = modelType
 
@@ -335,7 +384,7 @@ for file, item in cache.items():
         continue
     if not item['type']:
         continue
-    path = os.path.join(folderPath, item['type'], os.path.splitext(file)[0])
+    path = os.path.join(folderPath, settings['output_path'], item['type'], os.path.splitext(file)[0])
     if os.path.exists(path):
         print(f'"{file}" has been removed by user, deleting "{item["type"]}\{os.path.splitext(file)[0]}"')
         shutil.rmtree(path)
