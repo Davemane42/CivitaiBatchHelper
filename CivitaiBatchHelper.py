@@ -6,9 +6,12 @@ import glob
 import re
 import shutil
 
-from io import BytesIO
-from PIL import Image
-from PIL.PngImagePlugin import PngInfo
+import sys
+import subprocess
+import importlib.util
+
+import asyncio
+import time
 
 from tqdm import tqdm
 
@@ -19,32 +22,114 @@ exifRename = {
 }
 exifOrder = ['Prompt', 'Negative prompt', 'Steps', 'Sampler', 'CFG scale', 'Seed', 'Size', 'Model hash', 'Model', 'Denoising strength', 'Clip skip', 'ENSD', 'Hires upscale', 'Hires steps', 'Hires upscaler']
 
-# Copied req function from https://github.com/civitai/sd_civitai_extension/blob/c4d4b2e374eccb5f192929a1332e46852f494173/civitai/lib.py#L69
-
 base_url = 'https://civitai.com/api/v1'
-user_agent = 'CivitaiLink:ComfyUI'
+user_agent = 'CivitaiLink:CivitaiBatchHelper'
 download_chunk_size = 8192
 
-def req(endpoint, method='GET', data=None, params=None, headers=None):
-    """Make a request to the Civitai API."""
-    if headers is None:
-        headers = {}
-    headers['User-Agent'] = user_agent
-    api_key = settings['civitai_api_key']
-    if api_key is not None:
-        headers['Authorization'] = f'Bearer {api_key}'
-    if data is not None:
-        headers['Content-Type'] = 'application/json'
-        data = json.dumps(data)
-    if not endpoint.startswith('/'):
-        endpoint = '/' + endpoint
-    if params is None:
-        params = {}
-    response = requests.request(method, base_url+endpoint, data=data, params=params, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f'Error: {response.status_code} {response.text}')
-    return response.json()
+def is_installed(package, package_overwrite=None):
+    try:
+        spec = importlib.util.find_spec(package)
+    except ModuleNotFoundError:
+        pass
 
+    package = package_overwrite or package
+
+    if spec is None:
+        print(f"Installing {package}...")
+        command = f'"{sys.executable}" -m pip install {package}'
+  
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=os.environ)
+
+        if result.returncode != 0:
+            print(f"Couldn't install\nCommand: {command}\nError code: {result.returncode}")
+
+
+is_installed("aiohttp")
+is_installed("PIL")
+
+import aiohttp
+from io import BytesIO
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+
+# Get and download preview images
+async def get_all_images(images):
+    with tqdm(total=len(images), unit='images') as bar:
+        async with aiohttp.ClientSession() as session:
+            await asyncio.gather(*[get_image(session, image, bar) for image in images])
+
+async def get_image(session, image, bar):
+    headers = {'User-Agent': user_agent, 'Authorization': f"Bearer {settings['civitai_api_key']}"}
+    try:
+        async with session.get(url=image['url'], headers=headers) as response:
+            
+            image_data = BytesIO()
+
+            async for chunk in response.content.iter_chunked(download_chunk_size):
+                image_data.write(chunk)
+
+            if response.status != 200:
+                print(f"Scraping {image['path']} failed due to the return code {response.status}")
+                return
+
+            pil_image = Image.open(image_data)
+            metadata = PngInfo()
+            if image['pngInfo'] != '':
+                metadata.add_text('parameters', image['pngInfo'])
+                
+            pil_image.save(image['path'], format='PNG', pnginfo=metadata, compress_level=4)
+
+            bar.update(1)
+
+    except Exception as e:
+        print(f"Unable to get url {e.__class__}.")
+        print('\n'.join(e.args))
+
+# Get individual model description
+async def get_all_models(models):
+    result = []
+    with tqdm(total=len(models), unit='models') as bar:
+        async with aiohttp.ClientSession() as session:
+            result.extend(await asyncio.gather(*[get_model(session, hashKey, modelID, bar) for hashKey, modelID in models.items()]))
+
+    return result
+
+async def get_model(session, hashKey, modelID, bar):
+    url = f'{base_url}/models/{modelID}'
+    headers = {'User-Agent': user_agent, 'Authorization': f"Bearer {settings['civitai_api_key']}"}
+    try:
+        async with session.get(url=url, headers=headers) as response:
+            resp = await response.json()
+            bar.update(1)
+            return [hashKey, resp]
+    except Exception as e:
+        print(f'Unable to get "{url}" due to.')
+        print('\n'.join(e.args))
+
+#
+async def get_all_models_by_hash(hashes):
+    results = []
+    batches = []
+    for i in range(0, len(hashes), 100):
+        batches.append(json.dumps(hashes[i:i + 100]))
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            result = (await asyncio.gather(*[get_model_by_hash(session, batch) for batch in batches]))
+            for x in result:
+                results.extend(x)
+    except Exception as e:
+        print(f"Unable to get batch of hash due to.")
+        print('\n'.join(e.args))
+    
+    return results
+
+async def get_model_by_hash(session, hashes):
+    headers = {'User-Agent': user_agent, 'Authorization': f"Bearer {settings['civitai_api_key']}"}
+    headers['Content-Type'] = 'application/json'
+
+    async with session.post(url=f'{base_url}/model-versions/by-hash', headers=headers, data=hashes) as response:
+        return await response.json()
 
 def calculate_sha256(filename):
     hash_sha256 = hashlib.sha256()
@@ -63,11 +148,25 @@ def save_cache():
 def get_relative_path(path):
     return os.path.relpath(path, start=settings['models_path'])
 
+def lazyHTML2Text(text):
+    text = re.sub(r'<a.*?href="(.*?)".*?<\/a>', r'\g<1>', text) # Link
+    text = re.sub(r'<img.*?src="(.*?)".*?>', r'\g<1>', text) # Image
+    text = re.sub(r'<li>(.*?)<\/li>', r'- \g<1>', text) # List item
+
+    text = re.sub(r'<div(.*?)\/div>', r'\n\g<1>\n', text) # div
+    text = re.sub(r'<h[0-9]>(.*?)<\/h[0-9]>', r'\g<1>\n', text) # Header
+    text = re.sub(r'<p>(.*?)<\/p>', r'\g<1>\n', text) # Paragraph
+    text = re.sub(r'<br[^>]*>', '\n', text) # br
+
+    text = re.sub(r'<[^>]*>', '', text) # Remove all other <tag> or </tag>
+
+    return '\n'.join([f'\t{line.strip()}' for line in text.splitlines()])
+
 # Settings
 folderPath = os.path.join(os.path.dirname(os.path.realpath(__file__)))
 os.makedirs(folderPath, exist_ok=True)
 
-defaultSettings = {'civitai_api_key': None, 'models_path': None, 'output_path': None}
+defaultSettings = {'civitai_api_key': None, 'models_path': None, 'output_path': None, 'full_description': False}
 settingPath = os.path.join(folderPath, 'settings.json')
 try:
     with open(settingPath, 'r') as f:
@@ -154,7 +253,13 @@ for ext in filetypes:
 
 fileCount = len(files)
 lenCount = len(str(fileCount))
-print(f"\nfound: {fileCount} models\n")
+
+if fileCount == 0:
+    print(f'No files detected:')
+    input('press "enter" to exit')
+    exit()
+else:
+    print(f"\nfound: {fileCount} models\n")
 
 data = {}
 for i, file in enumerate(files):
@@ -169,12 +274,12 @@ for i, file in enumerate(files):
         if fileSize > 1:
             print(f'\nFile size is {fileSize:.2f}GB, this might take a while')
 
-        print(f'{i+1:>{lenCount}d}/{fileCount} caching hash {fileName} -> ',end="")
+        print(f'{i+1:>{lenCount}d}/{fileCount} caching hash "{fileName}" -> ',end="")
         sha256 = calculate_sha256(file).upper()
         cache[fileName] = {}
         cache[fileName]['SHA256'] = sha256
         cache[fileName]['type'] = None
-        print(f'{sha256}')
+        print(f'"{sha256}"')
 
         if fileSize > 1:
             save_cache()
@@ -186,28 +291,20 @@ for i, file in enumerate(files):
     data[sha256] = {}
     data[sha256]['path'] = file
     data[sha256]['fileName'] = fileName
-    data[sha256]['data'] = {}
+    data[sha256]['version'] = {}
     
 
 save_cache()
 
 # civitai request by hash
+startTime = time.time()
+
 hashes = [value for value in data.keys()]
-if len(hashes) != 0:
-    print(f"\nRequesting: {len(hashes)} models from Civitai.com")
+print(f"\nRequesting: {len(hashes)} models from Civitai.com")
+results = asyncio.run(get_all_models_by_hash(hashes))
 
-results = []
-try:
-    for i in range(0, len(hashes), 100):
-        batch = hashes[i:i + 100]
-        results.extend(req(f'/model-versions/by-hash', method='POST', data=batch))
-except:
-    print('Failed to fetch hash from Civitai')
-    input('press "enter" to exit')
-    exit()
-
-print(f"Matched: {len(results)} models\n")
-
+print(f"Agregating data of {len(results)} matched models:")
+models = {}
 for result in results:
     found = False
     for file in result['files']:
@@ -222,34 +319,43 @@ for result in results:
 
         if file['type'] == 'VAE':
             continue
-
-        data[sha256]['data'] = result
+        
+        data[sha256]['version'] = result
+        models[sha256] = result['modelId']
         found = True
         break
 
     if not found:
         print(f"ERROR: {result['model']['name']}")
 
+# get model data
+result = asyncio.run(get_all_models(models))
+for x in result:
+    data[x[0]]['model'] = x[1]
+
+print(f'Took {time.time() - startTime:.2f} seconds\n')
+
+# Main loop
 dataCount = len(data)
 lenCount = len(str(dataCount))
-for i, key in enumerate(data):
-    model = data[key]
+for i, hashKey in enumerate(data):
+    model = data[hashKey]
 
     counter = f'{i+1:>{lenCount}d}/{dataCount}'
 
-    if model["data"] == {}:
+    if model['version'] == {}:
         path = get_relative_path(model['path'])
         print(f'{counter} Could not find Civitai Data for "{path}"')
         continue
     
     fileName = os.path.splitext(model['fileName'])[0]
     
-    modelName = model['data']['model']['name']
-    modelType = model['data']['model']['type']
-    modelID = model['data']['modelId']
+    modelName = model['version']['model']['name']
+    modelType = model['version']['model']['type']
+    modelID = model['version']['modelId']
 
-    versionName = model['data']['name']
-    versionID = model['data']['id']
+    versionName = model['version']['name']
+    versionID = model['version']['id']
     
     newPath = os.path.join(folderPath, settings['output_path'], modelType, fileName)
 
@@ -257,40 +363,33 @@ for i, key in enumerate(data):
     os.makedirs(newPath, exist_ok=True)
     cache[model['fileName']]['type'] = modelType
 
-    url = f"https://civitai.com/models/{modelID}?modelVersionId={versionID}"
+    creator = model['model']['creator']['username']
+    fileText = f"Creator: {creator}\nhttps://civitai.com/user/{creator}/models"
 
-    # Lazy way to parse the HTML descriptions
-    if model['data']['description']:
+    fileText += f'\n\nModel type:   {modelType}\nModel Name:   {modelName}\nVersion Name: {versionName}'
+    fileText += f'\nhttps://civitai.com/models/{modelID}?modelVersionId={versionID}'
 
-        description = model['data']['description']
+    fileText += f"\n\nAllow no credit: {model['model']['allowNoCredit']}"
+    fileText += f"\nAllow Comercial Use: {model['model']['allowCommercialUse']}"
+    fileText += f"\nAllow Derivative: {model['model']['allowDerivatives']}"
+    fileText += f"\nAllow Different License: {model['model']['allowDifferentLicense']}"
 
-        description = re.sub(r'<a.*?href="(.*?)".*?<\/a>', r'\g<1>', description) # Link
-        description = re.sub(r'<img.*?src="(.*?)".*?>', r'\g<1>', description) # Image
-        description = re.sub(r'<li>(.*?)<\/li>', r'- \g<1>', description) # List item
+    
 
-        description = re.sub(r'<div(.*?)\/div>', r'\n\g<1>\n', description) # div
-        description = re.sub(r'<h[0-9]>(.*?)<\/h[0-9]>', r'\g<1>\n', description) # Header
-        description = re.sub(r'<p>(.*?)<\/p>', r'\g<1>\n', description) # Paragraph
-        description = re.sub(r'<br[^>]*>', '\n', description) # br
+    if model['version']['description']:
+        fileText += f"\n\nVersion Description:\n{lazyHTML2Text(model['version']['description'])}"
 
-        description = re.sub(r'<[^>]*>', '', description) # Remove all other <tag> or </tag>
+    if model['model']['description']:
+        fileText += f"\n\nModel Description:\n{lazyHTML2Text(model['model']['description'])}"
 
-        description = '\n'.join([line.strip() for line in description.splitlines()])
-
-        description = f'\n\nVersion Description:\n{description}'
-    else:
-        description = ''
-
-    if len(model['data']['trainedWords']) != 0:
-        triggerWords = f"\n\nTrigger Words:\n{', '.join(model['data']['trainedWords'])}"
-    else:
-        triggerWords = ""
+    if len(model['version']['trainedWords']) != 0:
+        fileText += f"\n\nTrigger Words:\n{', '.join(model['version']['trainedWords'])}"
 
     # info txt file
     newImages = []
-    if len(model['data']['images']) != 0:
+    if len(model['version']['images']) != 0:
         prompts = ''
-        for image in model['data']['images']:
+        for image in model['version']['images']:
             
             imageUrl = image['url']
 
@@ -336,44 +435,15 @@ for i, key in enumerate(data):
             prompts += f'\n\n{pngInfo}'
 
         if prompts != '':
-            examplePrompt = f'\n\nExample Prompts:{prompts}'
-        else:
-            examplePrompt = ''
-    else:
-        examplePrompt = ''
+            fileText += f'\n\nExample Prompts:{prompts}'
 
     with open(os.path.join(newPath, f'{fileName}.txt'), 'w', encoding='utf-8') as f:
-        f.write(f'Model type:   {modelType}\nModel Name:   {modelName}\nVersion Name: {versionName}\n{url}{description}{triggerWords}{examplePrompt}')
-    
-
-    newImagesCount = len(newImages)
+        f.write(fileText)
 
     # Download images preview files
-    if newImagesCount != 0:
-        print(f'\n{counter} Found {modelType} "{modelName}" version "{versionName}" on Civitai with {newImagesCount} preview images')
-
-        with tqdm(total=newImagesCount, unit='Images') as bar:
-            for image in newImages:
-                response = requests.get(image['url'], stream=True, headers={'User-Agent': user_agent})
-
-                if response.status_code == 404:
-                    bar.update(1)
-                    continue
-                
-                image_data = BytesIO()
-
-                for chunk in response.iter_content(chunk_size=download_chunk_size):
-                    if chunk:
-                        image_data.write(chunk)
-
-                pil_image = Image.open(image_data)
-                metadata = PngInfo()
-                if image['pngInfo'] != '':
-                    metadata.add_text('parameters', image['pngInfo'])
-                    
-                pil_image.save(image['path'], format='PNG', pnginfo=metadata, compress_level=4)
-
-                bar.update(1)
+    if len(newImages) != 0:
+        print(f'\n{counter} Found {modelType} "{modelName}" version "{versionName}" on Civitai with {len(newImages)} preview images')
+        asyncio.run(get_all_images(newImages))
 
 # Remove old folder/cache
 print()
