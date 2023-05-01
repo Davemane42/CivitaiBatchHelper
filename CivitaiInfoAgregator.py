@@ -1,30 +1,15 @@
 import hashlib
 import os
-import requests
 import json
 import glob
 import re
 import shutil
-
+import math
 import sys
 import subprocess
 import importlib.util
-
 import asyncio
-import time
-
 from tqdm import tqdm
-
-exifRename = {
-    'negativePrompt': 'Negative prompt',
-    'cfgScale': 'CFG scale',
-    'ENSD': 'ENSD'
-}
-exifOrder = ['Prompt', 'Negative prompt', 'Steps', 'Sampler', 'CFG scale', 'Seed', 'Size', 'Model hash', 'Model', 'Denoising strength', 'Clip skip', 'ENSD', 'Hires upscale', 'Hires steps', 'Hires upscaler']
-
-base_url = 'https://civitai.com/api/v1'
-user_agent = 'CivitaiLink:CivitaiBatchHelper'
-download_chunk_size = 8192
 
 def is_installed(package, package_overwrite=None):
     try:
@@ -36,12 +21,12 @@ def is_installed(package, package_overwrite=None):
 
     if spec is None:
         print(f"Installing {package}...")
-        command = f'"{sys.executable}" -m pip install {package}'
+        command = f'"{sys.executable}" -m pip install --no-cache-dir {package}'
   
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=os.environ)
 
         if result.returncode != 0:
-            print(f"Couldn't install\nCommand: {command}\nError code: {result.returncode}")
+            print(f"{error_color}Couldn't install\nCommand: {command}\nError code: {result.returncode}{reset_color}")
 
 
 is_installed("aiohttp")
@@ -52,9 +37,32 @@ from io import BytesIO
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
+fileExtentions = ('*.safetensors', '*.ckpt', '*.pt')
+ok_color = '[38;2;99;199;77m'
+error_color = '[38;2;255;0;68m'
+reset_color = '[37m'
+bar_color = ['#ff0044', '#f77622', '#fee761', '#63c74d']
+exifRename = {
+    'negativePrompt': 'Negative prompt',
+    'cfgScale': 'CFG scale',
+    'ENSD': 'ENSD'
+}
+exifOrder = ['Prompt', 'Negative prompt', 'Steps', 'Sampler', 'CFG scale', 'Seed', 'Size', 'Model hash', 'Model', 'Denoising strength', 'Clip skip', 'ENSD', 'Hires upscale', 'Hires steps', 'Hires upscaler']
+trainingMetadataAllow = ['ss_epoch', 'ss_clip_skip', 'ss_max_train_steps', 'ss_num_batches_per_epoch', 'ss_datasets', 'ss_tag_frequency']
+
+base_url = 'https://civitai.com/api/v1'
+user_agent = 'CivitaiLink:CivitaiInfoAgregator'
+download_chunk_size = 8192
+
+
+def update_bar(bar, amount=1):
+    index = min(math.floor(((bar.n+amount)/bar.total)*len(bar_color)), len(bar_color)-1)
+    bar.colour = bar_color[index]
+    bar.update(amount)
+
 # Get and download preview images
 async def get_all_images(images):
-    with tqdm(total=len(images), unit='images') as bar:
+    with tqdm(total=len(images), bar_format='{n_fmt}/{total_fmt} |{bar}| {percentage:3.0f}%') as bar:
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(*[get_image(session, image, bar) for image in images])
 
@@ -69,7 +77,9 @@ async def get_image(session, image, bar):
                 image_data.write(chunk)
 
             if response.status != 200:
-                print(f"Scraping {image['path']} failed due to the return code {response.status}")
+                bar.leave = False
+                bar.close()
+                print(f'{error_color}"{image["path"]}" failed Code: {response.status}{reset_color}\n')
                 return
 
             pil_image = Image.open(image_data)
@@ -79,18 +89,22 @@ async def get_image(session, image, bar):
                 
             pil_image.save(image['path'], format='PNG', pnginfo=metadata, compress_level=4)
 
-            bar.update(1)
+            bar.update()
 
     except Exception as e:
-        print(f"Unable to get url {e.__class__}.")
-        print('\n'.join(e.args))
+        print(f'{error_color}Unable to get url {e.__class__}.{reset_color}')
+        print('\n'.join())
+
 
 # Get individual model description
 async def get_all_models(models):
     result = []
-    with tqdm(total=len(models), unit='models') as bar:
-        async with aiohttp.ClientSession() as session:
-            result.extend(await asyncio.gather(*[get_model(session, hashKey, modelID, bar) for hashKey, modelID in models.items()]))
+    bar = tqdm(total=len(models), bar_format='{n_fmt}/{total_fmt} |{bar}| {percentage:3.0f}% {elapsed_s:.3f}s', dynamic_ncols=True, colour=bar_color[0])
+
+    async with aiohttp.ClientSession() as session:
+        result.extend(await asyncio.gather(*[get_model(session, hashKey, modelID, bar) for hashKey, modelID in models.items()]))
+
+    bar.close()
 
     return result
 
@@ -100,13 +114,16 @@ async def get_model(session, hashKey, modelID, bar):
     try:
         async with session.get(url=url, headers=headers) as response:
             resp = await response.json()
-            bar.update(1)
+
+            update_bar(bar, 1)
+            
             return [hashKey, resp]
     except Exception as e:
-        print(f'Unable to get "{url}" due to.')
+        print(f'{error_color}Unable to get "{url}" due to.{reset_color}')
         print('\n'.join(e.args))
 
-#
+
+# Batch 100 model at a time and get the data
 async def get_all_models_by_hash(hashes):
     results = []
     batches = []
@@ -119,7 +136,7 @@ async def get_all_models_by_hash(hashes):
             for x in result:
                 results.extend(x)
     except Exception as e:
-        print(f"Unable to get batch of hash due to.")
+        print(f'{error_color}Unable to get batch of hash due to.{reset_color}')
         print('\n'.join(e.args))
     
     return results
@@ -131,12 +148,16 @@ async def get_model_by_hash(session, hashes):
     async with session.post(url=f'{base_url}/model-versions/by-hash', headers=headers, data=hashes) as response:
         return await response.json()
 
-def calculate_sha256(filename):
+def calculate_sha256(file, bar=None):
     hash_sha256 = hashlib.sha256()
     blksize = 1024 * 1024
 
-    with open(filename, "rb") as f:
+    with open(file, "rb") as f:
         for chunk in iter(lambda: f.read(blksize), b""):
+
+            if bar:
+                update_bar(bar, len(chunk))
+
             hash_sha256.update(chunk)
 
     return hash_sha256.hexdigest()
@@ -152,6 +173,7 @@ def lazyHTML2Text(text):
     text = re.sub(r'<a.*?href="(.*?)".*?<\/a>', r'\g<1>', text) # Link
     text = re.sub(r'<img.*?src="(.*?)".*?>', r'\g<1>', text) # Image
     text = re.sub(r'<li>(.*?)<\/li>', r'- \g<1>', text) # List item
+    text = re.sub(r'<code>(.*?)<\/code>', r'「\g<1>」', text) # Code Block
 
     text = re.sub(r'<div(.*?)\/div>', r'\n\g<1>\n', text) # div
     text = re.sub(r'<h[0-9]>(.*?)<\/h[0-9]>', r'\g<1>\n', text) # Header
@@ -159,6 +181,7 @@ def lazyHTML2Text(text):
     text = re.sub(r'<br[^>]*>', '\n', text) # br
 
     text = re.sub(r'<[^>]*>', '', text) # Remove all other <tag> or </tag>
+    text = text.replace('&lt;', '<').replace('&gt;', '>') # <>
 
     return '\n'.join([f'\t{line.strip()}' for line in text.splitlines()])
 
@@ -167,7 +190,7 @@ folderPath = os.path.join(os.path.dirname(os.path.realpath(__file__)))
 os.makedirs(folderPath, exist_ok=True)
 
 defaultSettings = {'civitai_api_key': None, 'models_path': None, 'output_path': None, 'full_description': False}
-settingPath = os.path.join(folderPath, 'settings.json')
+settingPath = os.path.join(folderPath, 'CivitaiInfoAgregator_settings.json')
 try:
     with open(settingPath, 'r') as f:
         settings = json.load(f)
@@ -237,7 +260,7 @@ with open(settingPath, 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=1)
 
 # Cache
-cachePath = os.path.join(folderPath, settings['output_path'], 'cache.json')
+cachePath = os.path.join(folderPath, settings['output_path'], 'CivitaiInfoAgregator_cache.json')
 try:
     with open(cachePath, 'r') as f:
         cache = json.load(f)
@@ -247,16 +270,14 @@ except FileNotFoundError:
         cache = {}
 
 files = []
-filetypes = ('*.safetensors', '*.ckpt')
-for ext in filetypes:
+for ext in fileExtentions:
     files.extend(glob.glob(os.path.join(settings['models_path'], '**', ext), recursive=True))
 
 fileCount = len(files)
 lenCount = len(str(fileCount))
 
 if fileCount == 0:
-    print(f'No files detected:')
-    input('press "enter" to exit')
+    input(f'{error_color}No files detected:\npress "enter" to exit{reset_color}')
     exit()
 else:
     print(f"\nfound: {fileCount} models\n")
@@ -269,23 +290,27 @@ for i, file in enumerate(files):
     if fileName in cache:
         sha256 = cache[fileName]['SHA256']
     else:
-        fileSize = os.stat(file).st_size / (1024*1024*1024) # in GB
+        fileSize = os.stat(file).st_size
 
-        if fileSize > 1:
-            print(f'\nFile size is {fileSize:.2f}GB, this might take a while')
+        print(f'{i+1:>{lenCount}d}/{fileCount} caching hash "{fileName}"')
 
-        print(f'{i+1:>{lenCount}d}/{fileCount} caching hash "{fileName}" -> ',end="")
-        sha256 = calculate_sha256(file).upper()
+        if fileSize > 1024**3:
+            bar = tqdm(total=fileSize, unit='B', unit_scale=True, bar_format='{n_fmt}/{total_fmt} |{bar}| {percentage:3.0f}% {elapsed_s:.3f}s', dynamic_ncols=True, colour=bar_color[0])
+        else:
+            bar = None
+
+        sha256 = calculate_sha256(file, bar).upper()
         cache[fileName] = {}
         cache[fileName]['SHA256'] = sha256
         cache[fileName]['type'] = None
-        print(f'"{sha256}"')
 
-        if fileSize > 1:
+        if bar:
+            bar.leave = False
+            bar.close()
             save_cache()
     
     if sha256 in data:
-        print(f'"{get_relative_path(file)}" is a duplicate of "{get_relative_path(data[sha256]["path"])}"')
+        print(f'{error_color}"{get_relative_path(file)}" is a duplicate of "{get_relative_path(data[sha256]["path"])}"{reset_color}')
         continue
     
     data[sha256] = {}
@@ -297,16 +322,12 @@ for i, file in enumerate(files):
 save_cache()
 
 # civitai request by hash
-startTime = time.time()
-
 hashes = [value for value in data.keys()]
 print(f"\nRequesting: {len(hashes)} models from Civitai.com")
 results = asyncio.run(get_all_models_by_hash(hashes))
 
-print(f"Agregating data of {len(results)} matched models:")
 models = {}
 for result in results:
-    found = False
     for file in result['files']:
         
         if not 'SHA256' in file['hashes']:
@@ -322,18 +343,13 @@ for result in results:
         
         data[sha256]['version'] = result
         models[sha256] = result['modelId']
-        found = True
         break
 
-    if not found:
-        print(f"ERROR: {result['model']['name']}")
-
 # get model data
+print(f"Agregating data of {len(models)} matched models:")
 result = asyncio.run(get_all_models(models))
 for x in result:
     data[x[0]]['model'] = x[1]
-
-print(f'Took {time.time() - startTime:.2f} seconds\n')
 
 # Main loop
 dataCount = len(data)
@@ -367,6 +383,7 @@ for i, hashKey in enumerate(data):
     fileText = f"Creator: {creator}\nhttps://civitai.com/user/{creator}/models"
 
     fileText += f'\n\nModel type:   {modelType}\nModel Name:   {modelName}\nVersion Name: {versionName}'
+    fileText += f"\nBase version: {model['version']['baseModel']}"
     fileText += f'\nhttps://civitai.com/models/{modelID}?modelVersionId={versionID}'
 
     fileText += f"\n\nAllow no credit: {model['model']['allowNoCredit']}"
@@ -374,16 +391,14 @@ for i, hashKey in enumerate(data):
     fileText += f"\nAllow Derivative: {model['model']['allowDerivatives']}"
     fileText += f"\nAllow Different License: {model['model']['allowDifferentLicense']}"
 
-    
+    if len(model['version']['trainedWords']) != 0:
+        fileText += f"\n\nTrigger Words:\n{', '.join(model['version']['trainedWords'])}"
 
     if model['version']['description']:
         fileText += f"\n\nVersion Description:\n{lazyHTML2Text(model['version']['description'])}"
 
     if model['model']['description']:
         fileText += f"\n\nModel Description:\n{lazyHTML2Text(model['model']['description'])}"
-
-    if len(model['version']['trainedWords']) != 0:
-        fileText += f"\n\nTrigger Words:\n{', '.join(model['version']['trainedWords'])}"
 
     # info txt file
     newImages = []
@@ -435,7 +450,75 @@ for i, hashKey in enumerate(data):
             prompts += f'\n\n{pngInfo}'
 
         if prompts != '':
-            fileText += f'\n\nExample Prompts:{prompts}'
+            fileText += f'\n\n{"-"*100}\nExample Prompts:{prompts}'
+    
+    # File Metadata
+    with open(model['path'], "rb") as f:
+        text = f.read(1024 * 1024)
+        f.close()
+
+        try:
+            text = text.decode("iso-8859-1")
+            m = re.search(r'{"__metadata__":({".*"}?)', text)
+            
+            if m and m.group(1):
+                metadataText = m.group(1)
+
+                metadata = {}
+
+                for keyPairs in re.finditer(r'"([^"]*)":"([^{"]*?)"', metadataText):
+                    if not keyPairs.group(1) in trainingMetadataAllow:
+                        continue
+                    metadata[keyPairs.group(1)] = keyPairs.group(2)
+
+                for dictPairs in re.finditer(r'"([^"]*)":"([\[{].*?[\]}])"', metadataText):
+                    if not dictPairs.group(1) in trainingMetadataAllow:
+                        continue
+                    try:
+                        metadata[dictPairs.group(1)] = json.loads(dictPairs.group(2).replace('\\', ''))
+                    except:
+                        pass
+                
+                trainingText = f'\n\n{"-"*100}\nTraining Data:'
+
+                if 'ss_clip_skip' in metadata:
+                    trainingText += f"\n  Clip Skip: {metadata['ss_clip_skip']}"
+
+                if 'ss_epoch' in metadata:
+                    trainingText += f"\n  Epoch: {metadata['ss_epoch']}"
+                
+                if 'ss_max_train_steps' in metadata:
+                    trainingText += f"\n  Steps: {metadata['ss_max_train_steps']}"
+                
+                if 'ss_num_batches_per_epoch' in metadata:
+                    trainingText += f"\n  Batch / Epoch: {metadata['ss_num_batches_per_epoch']}"
+
+
+                # Tags
+                if 'ss_datasets' in metadata:
+                    metadata['tags'] = metadata['ss_datasets'][0]['tag_frequency']
+
+                elif 'ss_tag_frequency' in metadata:
+                    metadata['tags'] = metadata['ss_tag_frequency']
+                    
+                if 'tags' in metadata:
+                    key = next(iter(metadata['tags'].keys()))
+
+                    if not len(metadata['tags'][key].keys()) > 1:
+                        continue
+                    
+                    tagsSorted = (sorted(metadata['tags'][key].items(), key=lambda x: x[1], reverse=True))[:100]
+                    maxKey = max(len(v[0]) for v in tagsSorted)
+                    maxCount = max(len(str(tagsSorted[0][1])), 7)
+
+                    trainingText += f'\n\n  Tags:\n    {"[TAGS]":<{maxKey}}{"[COUNT]":^{maxCount}}'
+                    for tag in tagsSorted:
+                        trainingText += f'\n    {tag[0].strip():<{maxKey}}{tag[1]:^{maxCount}}'
+                    
+                fileText += trainingText
+        except Exception as e:
+            print(f"Unable to parse metadata for {fileName} -> {e.__class__}.")
+            print('\n  '.join(e.args))
 
     with open(os.path.join(newPath, f'{fileName}.txt'), 'w', encoding='utf-8') as f:
         f.write(fileText)
@@ -458,4 +541,4 @@ for file, item in cache.items():
         shutil.rmtree(path)
 
 save_cache()
-input('\nDone (press "enter" to exit)')
+input(f'\n{ok_color}Done (press "enter" to exit){reset_color}')

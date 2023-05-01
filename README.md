@@ -5,12 +5,17 @@ Then it will scan all of your checkpoints/loras ect... and create a .txt file wi
 - Creator/uploader
 - Model type
 - Model name
+- SD Base version
 - Version name
 - Civitai link
-- Model description
-- Version description (if available)
 - Trigger Words (if available)
+- Model description
 - Example Prompts (if available)
+- Training Data (if available)
+  - Clip Skip
+  - Epoch
+  - Steps
+  - Batch
 
 and also download the preview images with embeded pngInfo
 

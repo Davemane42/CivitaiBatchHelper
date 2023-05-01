@@ -1,9 +1,11 @@
-cache.json
-settings.json
+CivitaiInfoAgregator_cache.json
+CivitaiInfoAgregator_settings.json
 AestheticGradient/
 Checkpoint/
 Controlnet/
 Hypernetwork/
 LoCon/
 LORA/
+Other/
 Poses/
+TextualInversion/
