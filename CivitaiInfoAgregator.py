@@ -3,7 +3,6 @@ import os
 import json
 import glob
 import re
-import shutil
 import math
 import sys
 import subprocess
@@ -60,11 +59,15 @@ def update_bar(bar, amount=1):
     bar.colour = bar_color[index]
     bar.update(amount)
 
+def get_separator(title, lenght=50):
+    return f'┌{"─"*lenght}┐\n│{title:^{lenght}}│\n└{"─"*lenght}┘'
+
 # Get and download preview images
 async def get_all_images(images):
-    with tqdm(total=len(images), bar_format='{n_fmt}/{total_fmt} |{bar}| {percentage:3.0f}%') as bar:
-        async with aiohttp.ClientSession() as session:
-            await asyncio.gather(*[get_image(session, image, bar) for image in images])
+    bar = tqdm(total=len(images), bar_format='{n_fmt}/{total_fmt} |{bar}| {percentage:3.0f}%')
+    async with aiohttp.ClientSession() as session:
+        await asyncio.gather(*[get_image(session, image, bar) for image in images])
+    bar.close()
 
 async def get_image(session, image, bar):
     headers = {'User-Agent': user_agent, 'Authorization': f"Bearer {settings['civitai_api_key']}"}
@@ -76,20 +79,18 @@ async def get_image(session, image, bar):
             async for chunk in response.content.iter_chunked(download_chunk_size):
                 image_data.write(chunk)
 
-            if response.status != 200:
-                bar.leave = False
-                bar.close()
-                print(f'{error_color}"{image["path"]}" failed Code: {response.status}{reset_color}\n')
-                return
+            if response.status == 200:
 
-            pil_image = Image.open(image_data)
-            metadata = PngInfo()
-            if image['pngInfo'] != '':
-                metadata.add_text('parameters', image['pngInfo'])
-                
-            pil_image.save(image['path'], format='PNG', pnginfo=metadata, compress_level=4)
+                pil_image = Image.open(image_data)
+                metadata = PngInfo()
+                if image['pngInfo'] != '':
+                    metadata.add_text('parameters', image['pngInfo'])
+                    
+                pil_image.save(image['path'], format='PNG', pnginfo=metadata, compress_level=4)
+            else:
+                bar.write(f'{error_color}{bar.n}/{bar.total} "{os.path.relpath(image["path"], start=settings["output_path"])}" failed Code: {response.status}{reset_color}\n')
 
-            bar.update()
+            update_bar(bar, 1)
 
     except Exception as e:
         print(f'{error_color}Unable to get url {e.__class__}.{reset_color}')
@@ -137,7 +138,8 @@ async def get_all_models_by_hash(hashes):
                 results.extend(x)
     except Exception as e:
         print(f'{error_color}Unable to get batch of hash due to.{reset_color}')
-        print('\n'.join(e.args))
+        if e.args:
+            print('\n'.join(e.args))
     
     return results
 
@@ -148,30 +150,16 @@ async def get_model_by_hash(session, hashes):
     async with session.post(url=f'{base_url}/model-versions/by-hash', headers=headers, data=hashes) as response:
         return await response.json()
 
-def calculate_sha256(file, bar=None):
-    hash_sha256 = hashlib.sha256()
-    blksize = 1024 * 1024
-
-    with open(file, "rb") as f:
-        for chunk in iter(lambda: f.read(blksize), b""):
-
-            if bar:
-                update_bar(bar, len(chunk))
-
-            hash_sha256.update(chunk)
-
-    return hash_sha256.hexdigest()
-
-def save_cache():
-    with open(cachePath, 'w', encoding='utf-8') as f:
-        json.dump(cache, f, ensure_ascii=False, indent=1)
+def save_dict(dictionary, filePath):
+    with open(filePath, 'w', encoding='utf-8') as f:
+        json.dump(dictionary, f, ensure_ascii=False, indent=1)
 
 def get_relative_path(path):
     return os.path.relpath(path, start=settings['models_path'])
 
 def lazyHTML2Text(text):
-    text = re.sub(r'<a.*?href="(.*?)".*?<\/a>', r'\g<1>', text) # Link
-    text = re.sub(r'<img.*?src="(.*?)".*?>', r'\g<1>', text) # Image
+    text = re.sub(r'<a.*?href="(.*?)"[^>]*>(.*?)<\/a>', r' \g<2>->\g<1> ', text) # Link
+    text = re.sub(r'<img.*?src="(.*?)".*?>', r' \g<1> \n', text) # Image
     text = re.sub(r'<li>(.*?)<\/li>', r'- \g<1>', text) # List item
     text = re.sub(r'<code>(.*?)<\/code>', r'「\g<1>」', text) # Code Block
 
@@ -189,7 +177,7 @@ def lazyHTML2Text(text):
 folderPath = os.path.join(os.path.dirname(os.path.realpath(__file__)))
 os.makedirs(folderPath, exist_ok=True)
 
-defaultSettings = {'civitai_api_key': None, 'models_path': None, 'output_path': None, 'full_description': False}
+defaultSettings = {'civitai_api_key': None, 'models_path': None, 'output_path': None, 'fullres_preview': False, 'rescan': False}
 settingPath = os.path.join(folderPath, 'CivitaiInfoAgregator_settings.json')
 try:
     with open(settingPath, 'r') as f:
@@ -231,14 +219,16 @@ if not settings['models_path']:
             print("Input a valid input path")
 
 # Output folder
+defaultOutputFolder = os.path.join(folderPath, "models")
 if not settings['output_path']:
     print('\nThe output folder is where all the data will be generated')
     while True:
-        print(f'Default output path is: "{folderPath}"')
+        print(f'Default output path is: "{defaultOutputFolder}"')
 
         inputText = input("Confirm? (y/n): ")
         if inputText.lower() == "y" or inputText == "":
-            settings['output_path'] = folderPath
+            settings['output_path'] = defaultOutputFolder
+            os.makedirs(defaultOutputFolder, exist_ok=True)
             break
         elif inputText.lower() == "n":
             break
@@ -256,11 +246,11 @@ if not settings['output_path']:
                 print("Input a valid input path")
 
 # Save Settings
-with open(settingPath, 'w', encoding='utf-8') as f:
-        json.dump(settings, f, ensure_ascii=False, indent=1)
+save_dict(settings, settingPath)
 
 # Cache
-cachePath = os.path.join(folderPath, settings['output_path'], 'CivitaiInfoAgregator_cache.json')
+defaultCache = {'SHA256': None, 'civitai_has_data': None}
+cachePath = os.path.join(folderPath, 'CivitaiInfoAgregator_cache.json')
 try:
     with open(cachePath, 'r') as f:
         cache = json.load(f)
@@ -268,6 +258,8 @@ except FileNotFoundError:
     with open(settingPath, 'w') as f:
         json.dump({}, f, ensure_ascii=False, indent=1)
         cache = {}
+
+print(f"{ok_color}{get_separator('Civitai Agregator V1.0', os.get_terminal_size()[0]-2)}{reset_color}")
 
 files = []
 for ext in fileExtentions:
@@ -280,15 +272,17 @@ if fileCount == 0:
     input(f'{error_color}No files detected:\npress "enter" to exit{reset_color}')
     exit()
 else:
-    print(f"\nfound: {fileCount} models\n")
+    print(f"found: {fileCount} models\n")
 
 data = {}
+hashes = []
 for i, file in enumerate(files):
     
     fileName = os.path.split(file)[1]
    
     if fileName in cache:
         sha256 = cache[fileName]['SHA256']
+        cache[fileName] = defaultCache.copy() | cache[fileName]
     else:
         fileSize = os.stat(file).st_size
 
@@ -299,30 +293,61 @@ for i, file in enumerate(files):
         else:
             bar = None
 
-        sha256 = calculate_sha256(file, bar).upper()
-        cache[fileName] = {}
+        # Calculate SHA256 hash
+        hash_sha256 = hashlib.sha256()
+        blksize = 1024 * 1024
+
+        with open(file, "rb") as f:
+            for chunk in iter(lambda: f.read(blksize), b""):
+
+                if bar:
+                    update_bar(bar, len(chunk))
+
+                hash_sha256.update(chunk)
+
+        sha256 = hash_sha256.hexdigest().upper()
+
+        cache[fileName] = defaultCache.copy()
         cache[fileName]['SHA256'] = sha256
-        cache[fileName]['type'] = None
 
         if bar:
             bar.leave = False
             bar.close()
-            save_cache()
+            save_dict(cache, cachePath)
     
     if sha256 in data:
-        print(f'{error_color}"{get_relative_path(file)}" is a duplicate of "{get_relative_path(data[sha256]["path"])}"{reset_color}')
+        print(f'{error_color}"{get_relative_path(file)}" is a duplicate of "{get_relative_path(data[sha256]["filepath"])}"{reset_color}')
         continue
-    
+
     data[sha256] = {}
-    data[sha256]['path'] = file
-    data[sha256]['fileName'] = fileName
+    data[sha256]['filepath'] = file
     data[sha256]['version'] = {}
+
+    modelFolder = os.path.relpath(file, start=settings['models_path'])
+    modelFolder = os.path.join(settings['output_path'], os.path.splitext(modelFolder)[0])
+    infoPath = os.path.join(modelFolder, os.path.splitext(os.path.split(file)[1])[0]+'.txt')
+
+    data[sha256]['model_folder'] = modelFolder
+    
+    ifNew = cache[fileName]['civitai_has_data'] == None
+    ifMissingFile = (cache[fileName]['civitai_has_data'] == True and (not os.path.exists(modelFolder) or not os.path.exists(infoPath)))
+    if ifNew or ifMissingFile or settings['rescan']:
+        hashes.append(sha256)
     
 
-save_cache()
+save_dict(cache, cachePath)
+
+if settings['rescan']:
+    print('RESCAN')
+    settings['rescan'] = False
+    save_dict(settings, settingPath)
+
+if len(hashes) == 0:
+    input(f'No new model to match\n{ok_color}Done (press "enter" to exit){reset_color}')
+    exit()
+
 
 # civitai request by hash
-hashes = [value for value in data.keys()]
 print(f"\nRequesting: {len(hashes)} models from Civitai.com")
 results = asyncio.run(get_all_models_by_hash(hashes))
 
@@ -348,23 +373,33 @@ for result in results:
 # get model data
 print(f"Agregating data of {len(models)} matched models:")
 result = asyncio.run(get_all_models(models))
+newModels = {}
 for x in result:
-    data[x[0]]['model'] = x[1]
+    newModels[x[0]] = data[x[0]]
+    newModels[x[0]]['model'] = x[1]
+
+print()
+
+
+for hashKey in hashes:
+    if not hashKey in newModels and not data[hashKey]['version']:
+        path = get_relative_path(data[hashKey]['filepath'])
+        print(f'Could not find Civitai Data for "{path}"')
+
+        cache[fileName]['civitai_has_data'] = False
 
 # Main loop
-dataCount = len(data)
+dataCount = len(newModels)
 lenCount = len(str(dataCount))
-for i, hashKey in enumerate(data):
-    model = data[hashKey]
+newImages = []
+for i, hashKey in enumerate(newModels):
+    model = newModels[hashKey]
 
     counter = f'{i+1:>{lenCount}d}/{dataCount}'
 
-    if model['version'] == {}:
-        path = get_relative_path(model['path'])
-        print(f'{counter} Could not find Civitai Data for "{path}"')
-        continue
+    fileName = os.path.split(model['filepath'])[1]
+    infoPath = os.path.join(model['model_folder'], os.path.splitext(fileName)[0]+'.txt')
     
-    fileName = os.path.splitext(model['fileName'])[0]
     
     modelName = model['version']['model']['name']
     modelType = model['version']['model']['type']
@@ -372,12 +407,10 @@ for i, hashKey in enumerate(data):
 
     versionName = model['version']['name']
     versionID = model['version']['id']
-    
-    newPath = os.path.join(folderPath, settings['output_path'], modelType, fileName)
 
-    os.makedirs(os.path.join(folderPath, settings['output_path'], modelType), exist_ok=True)
-    os.makedirs(newPath, exist_ok=True)
-    cache[model['fileName']]['type'] = modelType
+    print(f'{counter} Found {modelType} "{modelName}" version "{versionName}" on Civitai ')
+
+    os.makedirs(model['model_folder'], exist_ok=True)
 
     creator = model['model']['creator']['username']
     fileText = f"Creator: {creator}\nhttps://civitai.com/user/{creator}/models"
@@ -386,30 +419,28 @@ for i, hashKey in enumerate(data):
     fileText += f"\nBase version: {model['version']['baseModel']}"
     fileText += f'\nhttps://civitai.com/models/{modelID}?modelVersionId={versionID}'
 
-    fileText += f"\n\nAllow no credit: {model['model']['allowNoCredit']}"
-    fileText += f"\nAllow Comercial Use: {model['model']['allowCommercialUse']}"
-    fileText += f"\nAllow Derivative: {model['model']['allowDerivatives']}"
-    fileText += f"\nAllow Different License: {model['model']['allowDifferentLicense']}"
-
     if len(model['version']['trainedWords']) != 0:
-        fileText += f"\n\nTrigger Words:\n{', '.join(model['version']['trainedWords'])}"
+        fileText += f"\n\n{get_separator('Trigger Words:')}\n{', '.join(model['version']['trainedWords'])}"
 
     if model['version']['description']:
-        fileText += f"\n\nVersion Description:\n{lazyHTML2Text(model['version']['description'])}"
+        fileText += f"\n\n{get_separator('Version Description:')}\n{lazyHTML2Text(model['version']['description'])}"
 
     if model['model']['description']:
-        fileText += f"\n\nModel Description:\n{lazyHTML2Text(model['model']['description'])}"
+        fileText += f"\n\n{get_separator('Model Description:')}\n{lazyHTML2Text(model['model']['description'])}"
 
     # info txt file
-    newImages = []
+    #newImages = []
     if len(model['version']['images']) != 0:
-        prompts = ''
+        prompts = []
         for image in model['version']['images']:
-            
-            imageUrl = image['url']
+
+            if settings['fullres_preview']:
+                imageUrl = re.sub(r'\/width=[0-9]*\/', f"/width={image['width']}/", image['url'])
+            else:
+                imageUrl = image['url']
 
             imageID = os.path.splitext(os.path.basename(imageUrl))[0]
-            imagePath = os.path.join(newPath, f'preview_{imageID}.png')
+            imagePath = os.path.join(model['model_folder'], f'preview_{imageID}.png')
             
             # reconstruct auto1111 exif data
             pngInfo = ''
@@ -441,19 +472,29 @@ for i, hashKey in enumerate(data):
 
                 pngInfo += ', '.join(parameters)
 
-            # Remove blank lines
-            pngInfo = '\n'.join([ll.rstrip() for ll in pngInfo.splitlines() if ll.strip()])
+                # Remove blank lines
+                pngInfo = '\n'.join([ll.rstrip() for ll in pngInfo.splitlines() if ll.strip()])
 
-            if not os.path.exists(imagePath):
-                newImages.append({'url': imageUrl, 'path': imagePath, 'pngInfo': pngInfo})
+                if not os.path.exists(imagePath):
+                    newImages.append({'url': imageUrl, 'path': imagePath, 'pngInfo': pngInfo})
             
-            prompts += f'\n\n{pngInfo}'
+            if pngInfo:
+                prompts.append(pngInfo)
 
-        if prompts != '':
-            fileText += f'\n\n{"-"*100}\nExample Prompts:{prompts}'
-    
+        if len(prompts) != 0:
+            fileText += f'\n\n{get_separator("Example Prompts:")}\n'
+            fileText += '\n\n'.join(prompts)
+
+
+    fileText += f"\n\n{get_separator('Licenses:')}"
+    fileText += f"\n\nAllow no credit: {model['model']['allowNoCredit']}"
+    fileText += f"\nAllow Comercial Use: {model['model']['allowCommercialUse']}"
+    fileText += f"\nAllow Derivative: {model['model']['allowDerivatives']}"
+    fileText += f"\nAllow Different License: {model['model']['allowDifferentLicense']}"
+
+
     # File Metadata
-    with open(model['path'], "rb") as f:
+    with open(model['filepath'], "rb") as f:
         text = f.read(1024 * 1024)
         f.close()
 
@@ -479,7 +520,7 @@ for i, hashKey in enumerate(data):
                     except:
                         pass
                 
-                trainingText = f'\n\n{"-"*100}\nTraining Data:'
+                trainingText = f"\n\n{get_separator('Training Data:')}"
 
                 if 'ss_clip_skip' in metadata:
                     trainingText += f"\n  Clip Skip: {metadata['ss_clip_skip']}"
@@ -504,41 +545,31 @@ for i, hashKey in enumerate(data):
                 if 'tags' in metadata:
                     key = next(iter(metadata['tags'].keys()))
 
-                    if not len(metadata['tags'][key].keys()) > 1:
-                        continue
-                    
-                    tagsSorted = (sorted(metadata['tags'][key].items(), key=lambda x: x[1], reverse=True))[:100]
-                    maxKey = max(len(v[0]) for v in tagsSorted)
-                    maxCount = max(len(str(tagsSorted[0][1])), 7)
+                    if len(metadata['tags'][key].keys()) != 0:                    
+                        tagsSorted = (sorted(metadata['tags'][key].items(), key=lambda x: x[1], reverse=True))[:100]
+                        maxKey = max(len(v[0]) for v in tagsSorted)
+                        maxCount = max(len(str(tagsSorted[0][1])), 7)
 
-                    trainingText += f'\n\n  Tags:\n    {"[TAGS]":<{maxKey}}{"[COUNT]":^{maxCount}}'
-                    for tag in tagsSorted:
-                        trainingText += f'\n    {tag[0].strip():<{maxKey}}{tag[1]:^{maxCount}}'
-                    
-                fileText += trainingText
+                        trainingText += f'\n\n  Tags:\n    {"[TAGS]":<{maxKey}}│{"[COUNT]":^{maxCount}}\n   ─{"─"*maxKey}┼{"─"*maxCount}─'
+                        for tag in tagsSorted:
+                            trainingText += f'\n    {tag[0].strip():<{maxKey}}│{tag[1]:^{maxCount}}'
+                
+                if metadata:
+                    fileText += trainingText
+
         except Exception as e:
             print(f"Unable to parse metadata for {fileName} -> {e.__class__}.")
             print('\n  '.join(e.args))
 
-    with open(os.path.join(newPath, f'{fileName}.txt'), 'w', encoding='utf-8') as f:
+    with open(infoPath, 'w', encoding='utf-8') as f:
         f.write(fileText)
 
-    # Download images preview files
-    if len(newImages) != 0:
-        print(f'\n{counter} Found {modelType} "{modelName}" version "{versionName}" on Civitai with {len(newImages)} preview images')
-        asyncio.run(get_all_images(newImages))
+    cache[fileName]['civitai_has_data'] = True
+    
+save_dict(cache, cachePath)
 
-# Remove old folder/cache
-print()
-for file, item in cache.items():
-    if item['SHA256'] in data:
-        continue
-    if not item['type']:
-        continue
-    path = os.path.join(folderPath, settings['output_path'], item['type'], os.path.splitext(file)[0])
-    if os.path.exists(path):
-        print(f'"{file}" has been removed by user, deleting "{item["type"]}\{os.path.splitext(file)[0]}"')
-        shutil.rmtree(path)
+# Download images preview files
+print(f'\nDownloading new preview images')
+asyncio.run(get_all_images(newImages))
 
-save_cache()
 input(f'\n{ok_color}Done (press "enter" to exit){reset_color}')

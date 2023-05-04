@@ -1,4 +1,6 @@
 # CivitaiBatchHelper
+### If you used an older version, output folders now follow the same structure as the models (nested folder) 
+---
  
 When you run it for the first time, it will ask you for an civitai API key and a path to your models folder.  
 Then it will scan all of your checkpoints/loras ect... and create a .txt file with
